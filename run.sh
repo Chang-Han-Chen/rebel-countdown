@@ -7,7 +7,7 @@ if [[ ${1:-} == --dry-run ]]; then
     shift
 fi
 if [[ $# -lt 2 || $2 != /* ]]; then
-    echo "Usage: $0 [--dry-run] {ordinary|centered|pg|centered-pg|sampler-reference} /absolute/output [key=value ...]" >&2
+    echo "Usage: $0 [--dry-run] {ordinary|centered|pg|centered-pg|sampler-reference|centered-sampler-reference} /absolute/output [key=value ...]" >&2
     exit 2
 fi
 
@@ -18,6 +18,7 @@ case $variant in
     ordinary) method=(rl.rebel=true rl.sc=false) ;;
     centered) method=(rl.rebel=true rl.sc=true) ;;
     sampler-reference) method=(rl.rebel=true rl.sc=false rl.rebel_reference=sampler) ;;
+    centered-sampler-reference) method=(rl.rebel=true rl.sc=true rl.rebel_reference=sampler) ;;
     pg) method=(rl.sc=false opt.lr=3e-6) ;;
     centered-pg) method=(rl.sc=true opt.lr=3e-6) ;;
     *) echo "Unknown method: $variant" >&2; exit 2 ;;

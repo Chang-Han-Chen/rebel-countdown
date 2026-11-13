@@ -1,5 +1,70 @@
+diff --git a/models/sampling.py b/models/sampling.py
+index 1355328..fdb13bf 100644
+--- a/models/sampling.py
++++ b/models/sampling.py
+@@ -16,6 +16,7 @@ class SamplingState(NamedTuple):
+     kv: list
+     done: jax.Array
+     token_logprobs: jax.Array
++    mean_logprobs: jax.Array | None
+     vocab_logprobs: jax.Array | None
+     head: topk.Carry | None
+ 
+@@ -43,32 +44,45 @@ def _step(state, forward, weights, prompt_lengths, eos_id):
+                       jax.typeof(logprobs).sharding.spec)
+     token_logprobs = state.token_logprobs.at[:, state.position].set(
+         jnp.where(state.done, 0.0, (targets * logprobs).sum(-1)))
++    mean_logprobs = state.mean_logprobs
++    if mean_logprobs is not None:
++        probabilities = jnp.exp(logprobs)
++        mean = jnp.sum(probabilities * jnp.where(jnp.isfinite(logprobs), logprobs, 0.0), axis=-1)
++        mean_logprobs = mean_logprobs.at[:, state.position].set(jnp.where(state.done, 0.0, mean))
+     done = state.done | (sampling & (sampled == eos_id))
+-    return SamplingState(state.position + 1, key, tokens, kv, done, token_logprobs, vocab_logprobs, head)
++    return SamplingState(state.position + 1, key, tokens, kv, done, token_logprobs,
++                         mean_logprobs, vocab_logprobs, head)
+ 
+ 
+-@partial(jax.jit, static_argnames=("forward", "init_kv", "vocab_size", "logprobs_dtype", "logprobs_topk"))
++@partial(jax.jit, static_argnames=("forward", "init_kv", "vocab_size", "logprobs_dtype",
++                                 "logprobs_topk", "record_mean_logprobs"))
+ def _generate(key, forward, init_kv, weights, tokens, prompt_lengths,
+-              eos_id, vocab_size, logprobs_dtype, logprobs_topk):
++              eos_id, vocab_size, logprobs_dtype, logprobs_topk, record_mean_logprobs):
+     batch_size, seq_len = tokens.shape
+     state = SamplingState(
+         position=0, key=key, tokens=reshard(tokens, P("data", None)), kv=init_kv(batch_size, seq_len),
+         done=jnp.zeros(batch_size, bool, out_sharding=P("data")),
+         token_logprobs=jnp.zeros((batch_size, seq_len), jnp.float32, out_sharding=P("data", None)),
++        mean_logprobs=jnp.zeros((batch_size, seq_len), jnp.float32, out_sharding=P("data", None))
++        if record_mean_logprobs else None,
+         vocab_logprobs=None if logprobs_dtype is None else jnp.zeros(
+             (batch_size, seq_len, vocab_size), logprobs_dtype, out_sharding=P("data", None, "model")),
+         head=topk.init(batch_size, seq_len, vocab_size, logprobs_topk) if logprobs_topk else None)
+     state = jax.lax.while_loop(lambda state: (state.position + 1 < seq_len) & (~state.done).any(),
+                                lambda state: _step(state, forward, weights, prompt_lengths, eos_id), state)
+     head_logprobs, head_ids = topk.finalize(state.head, state.position, seq_len) if logprobs_topk else (None, None)
+-    return state.tokens, state.token_logprobs, state.vocab_logprobs, head_logprobs, head_ids
++    result = state.tokens, state.token_logprobs, state.vocab_logprobs, head_logprobs, head_ids
++    return (*result, state.mean_logprobs) if record_mean_logprobs else result
+ 
+ 
+-def generate(key, model, weights, forward, init_kv, tokens, prompt_lengths, logprobs_dtype=None, logprobs_topk=0):
++def generate(key, model, weights, forward, init_kv, tokens, prompt_lengths, logprobs_dtype=None, logprobs_topk=0,
++             *, record_mean_logprobs=False):
+     """Fill a fixed token batch after each row's prompt and record the sampling
+     distribution: per-token logprobs always, plus either the full [B, T, V]
+     logprobs (logprobs_dtype) or the per-step top-k head (logprobs_topk), which
+-    is what score centering consumes at ~V/k the memory."""
++    is what score centering consumes at ~V/k the memory. Optionally append the
++    exact sampler expectation of log probability at each position."""
+     prompt_lengths = reshard(jnp.asarray(prompt_lengths, jnp.int32), P("data"))
+     return _generate(reshard(key, P()), forward, init_kv, weights, tokens, prompt_lengths,
+-                     model.tokenizer.eos_token_id, model.config["vocab_size"], logprobs_dtype, logprobs_topk)
++                     model.tokenizer.eos_token_id, model.config["vocab_size"], logprobs_dtype, logprobs_topk,
++                     record_mean_logprobs)
 diff --git a/train_rl.py b/train_rl.py
-index 48644d0..7826ad9 100644
+index 48644d0..ab9555d 100644
 --- a/train_rl.py
 +++ b/train_rl.py
 @@ -1,7 +1,11 @@
@@ -43,7 +108,7 @@ index 48644d0..7826ad9 100644
 +  pg_lr_probe_sgd_baseline: null
 +  pg_lr_probe_microbatch_prompts: null
 +  rebel: false
-+  rebel_reference: trainer  # trainer | sampler (ordinary REBEL ablation)
++  rebel_reference: trainer  # trainer | sampler
 +  rebel_beta: 1.0
 +  rebel_dtype: bfloat16
 +  rebel_inner_steps: 4
@@ -293,8 +358,8 @@ index 48644d0..7826ad9 100644
 +
 +    if cfg.rl.rebel_reference not in ("trainer", "sampler"):
 +        raise ValueError("REBEL reference must be trainer or sampler")
-+    if cfg.rl.rebel_reference == "sampler" and (not cfg.rl.rebel or cfg.rl.sc or probe_active):
-+        raise ValueError("The sampler reference is supported for ordinary REBEL training")
++    if cfg.rl.rebel_reference == "sampler" and (not cfg.rl.rebel or probe_active):
++        raise ValueError("The sampler reference requires REBEL training")
 +    if cfg.rl.rebel:
 +        if cfg.sampler.staleness or cfg.rl["is"].level is not None:
 +            raise ValueError("REBEL requires a fresh sampler and no importance-sampling correction")
@@ -353,7 +418,7 @@ index 48644d0..7826ad9 100644
      def perturb_and_quantize(weights, noise):
          if noise is not None:
              weights = jax.tree.map(jnp.add, weights, noise)
-@@ -120,20 +390,23 @@ def train(cfg):
+@@ -120,76 +390,599 @@ def train(cfg):
  
      sampler_forward = partial(model.forward, dtype=float_dtype, kv_quant_bits=cfg.sampler.kv_quant_bits)
      sampler_init_kv = partial(model.init_kv, dtype=float_dtype)
@@ -376,20 +441,29 @@ index 48644d0..7826ad9 100644
  
 -    def sample(rows, weights, key, forward, vocab_logprobs=None):
 +    def sample(rows, weights, key, forward, vocab_logprobs=None, *, init_kv=sampler_init_kv,
-+               trace_records=None):
++               trace_records=None, record_mean_logprobs=False):
          """group_size scored completions per row. Returns the trainer-side batch,
          the full sampler logprobs if requested (still on the sampler mesh), the
          rewards, and rollout statistics."""
-@@ -141,7 +414,7 @@ def train(cfg):
+         rows = [{**row, "example_id": i} for i, row in enumerate(rows) for _ in range(group_size)]
          tokens, prompt_lengths = rollout.prompt_buffer(rows, model.tokenizer, seq_len, cfg.env.prompt_format)
          with jax.set_mesh(sampler_mesh):
-             tokens, token_logprobs, vocab, head_logprobs, head_ids = sampling.generate(
+-            tokens, token_logprobs, vocab, head_logprobs, head_ids = sampling.generate(
 -                key, model, weights, forward, sampler_init_kv, tokens, prompt_lengths,
++            tokens, token_logprobs, vocab, head_logprobs, head_ids, *mean_logprobs = sampling.generate(
 +                key, model, weights, forward, init_kv, tokens, prompt_lengths,
                  logprobs_dtype=jnp.float32 if vocab_logprobs == "full" else None,
-                 logprobs_topk=vocab_logprobs if isinstance(vocab_logprobs, int) else 0)
+-                logprobs_topk=vocab_logprobs if isinstance(vocab_logprobs, int) else 0)
++                logprobs_topk=vocab_logprobs if isinstance(vocab_logprobs, int) else 0,
++                record_mean_logprobs=record_mean_logprobs)
              host_tokens = np.asarray(tokens)
-@@ -153,43 +426,555 @@ def train(cfg):
+         mask, lengths, texts = rollout.completions(host_tokens, prompt_lengths, model.tokenizer)
+         batch = {"tokens": reshard(tokens, token_sharding), "mask": jax.device_put(mask, token_sharding),
+                  "sampling_token_logprobs": reshard(token_logprobs, token_sharding)}
++        if mean_logprobs:
++            batch["sampling_mean_logprobs"] = reshard(mean_logprobs[0], token_sharding)
+         if head_ids is not None:
+             batch |= {"center_ids": reshard(head_ids, head_sharding),
                        "center_logprobs": reshard(head_logprobs, head_sharding)}
          truncated = (prompt_lengths + lengths >= seq_len) & (host_tokens[:, -1] != model.tokenizer.eos_token_id)
          stats = {"mean_completion_len": lengths.mean(), "frac_truncated": truncated.mean()}
@@ -613,12 +687,17 @@ index 48644d0..7826ad9 100644
 +
 +        @jax.jit
 +        def reference(weights, batch):
++            hidden, head_weights = None, None
++            if cfg.rl.sc or cfg.rl.rebel_reference == "trainer":
++                hidden = trainer_hidden(weights, batch["tokens"])
++                head_weights = {head_key: weights[head_key]}
 +            if cfg.rl.rebel_reference == "sampler":
 +                # The sampler stores each next-token log probability at its prefix index.
-+                scores = jnp.where(batch["mask"][:, 1:], batch["sampling_token_logprobs"][:, :-1], 0.0)
-+                return scores.sum(axis=1), None, None
-+            hidden = trainer_hidden(weights, batch["tokens"])
-+            head_weights = {head_key: weights[head_key]}
++                scores = batch["sampling_token_logprobs"][:, :-1]
++                if cfg.rl.sc:
++                    scores = scores - batch["sampling_mean_logprobs"][:, :-1]
++                scores = jnp.where(batch["mask"][:, 1:], scores, 0.0).sum(axis=1)
++                return scores, hidden, head_weights
 +            if cfg.rl.sc:
 +                scores = rebel_scores(hidden, head_weights, batch, hidden, head_weights)
 +                return scores, hidden, head_weights
@@ -950,14 +1029,14 @@ index 48644d0..7826ad9 100644
          batch, vocab, rewards, stats = sample(
 -            rows, sampler_weights, sample_key, sampler_forward, cfg.sampler.vocab_logprobs)
 +            rows, sampler_weights, sample_key, sampler_forward, cfg.sampler.vocab_logprobs,
-+            trace_records=trace_records)
++            trace_records=trace_records, record_mean_logprobs=cfg.rl.sc and cfg.rl.rebel_reference == "sampler")
          advantages = losses.compute_advantages(rewards, group_size, cfg.rl.reward_mode)
 +        if trace_records is not None:
 +            log_pg_traces(step, batch, trace_records, advantages)
          batch["advantages"] = jax.device_put(advantages, NamedSharding(trainer_mesh, P("data")))
          if cfg.sampler.staleness == 0:
              del sampler_weights
-@@ -198,7 +983,61 @@ def train(cfg):
+@@ -198,7 +991,61 @@ def train(cfg):
              # and collective scratch of this [B, T, V] array set the memory peak.
              batch["sampling_vocab_logprobs"] = reshard(vocab, NamedSharding(trainer_mesh, P("data", None, "model")))
              del vocab
@@ -1020,7 +1099,7 @@ index 48644d0..7826ad9 100644
          del batch
  
          reward = rewards.mean()
-@@ -206,11 +1045,17 @@ def train(cfg):
+@@ -206,11 +1053,17 @@ def train(cfg):
          collapse_steps = collapse_steps + 1 if reward < cfg.stop.collapse * peak_reward else 0
          utils.log_metrics(step, {"reward": reward, "frac_nonzero_advantage": (advantages != 0).mean(),
                                   **stats, **opt_metrics, **metrics}, run_dir)
