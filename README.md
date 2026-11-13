@@ -4,7 +4,7 @@ Does ordinary REBEL tolerate train–inference mismatch better than policy gradi
 
 ## What to run
 
-1. **Measure sensitivity to mismatch.** Run ordinary PG, score-centered PG, ordinary REBEL, and score-centered REBEL at `σ = 0, 0.02, 0.05` for 27 outer updates with seed 1. Compare each noisy curve against that method's zero-noise control. Ordinary REBEL rose from 10.2% to 40.4% by update 11 in the `σ = 0.02` pilot. The longer run tests whether it keeps learning.
+1. **Measure sensitivity to mismatch.** Run ordinary PG, score-centered PG, ordinary REBEL, and score-centered REBEL at `σ = 0, 0.02, 0.05` for 100 outer updates with seed 1. Compare each noisy curve against that method's zero-noise control. Ordinary REBEL rose from 10.2% to 40.4% by update 11 in the `σ = 0.02` pilot. The longer run tests whether it keeps learning.
 2. **Test whether centering helps REBEL.** If ordinary REBEL learns in the control and loses held-out accuracy under noise, check whether score-centered REBEL retains accuracy at that same noise. Repeat the informative conditions across matched seeds before concluding that either method is more robust.
 3. **Test the denominator with and without centering.** At a matched noise level and seed, compare `ordinary` with `sampler-reference`, and `centered` with `centered-sampler-reference`. All sample from the perturbed policy $q_t$. The default denominator is the frozen clean trainer $p_t$. The sampler-reference denominator uses the logged $\log q_t$ for each sampled token. The combined variant centers that reference by subtracting the exact $\mathbb E_{a\sim q_t}[\log q_t(a)]$ at each prefix. Both centered variants use the same top-128 sampler probabilities and frozen trainer tail approximation to center the trainer scores.
 
@@ -22,7 +22,7 @@ From your GPU allocation, run the 12 conditions in order. The script runs both P
 
 Use `./sweep.sh --dry-run /scratch/rebel/seed-1` to preview the commands. Add `pg` or `rebel` after the output path to run only that phase. For another matched seed, use a fresh output directory and append `all run.seed=2`. The output directories are organized by method and noise.
 
-Run `./sweep.sh /scratch/rebel/seed-1 sampler-reference` for the six additional sampler-reference runs at the same noise levels. These reuse the same hyperparameters.
+Run `./sweep.sh /scratch/rebel/seed-1 sampler-reference` for the six additional sampler-reference runs at the same noise levels. These use the same REBEL settings and 100-update budget.
 
 To schedule a condition individually, call `run.sh` with a fresh absolute output directory.
 

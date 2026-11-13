@@ -39,7 +39,7 @@ command=(
     "$repo/.venv/bin/python" -u train_rl.py "model.source=$weights/Qwen3-0.6B"
     env.id=countdown env.prompt_format=chat
     rl.num_prompts=64 rl.group_size=8 rl.seq_len=512 eval.num_prompts=64 eval.every_steps=2
-    stop.steps=27 stop.collapse=0 run.seed=1
+    stop.steps=100 stop.collapse=0 run.seed=1
     opt.optimizer=adamw opt.lr=1.2e-7 opt.eps=1e-8 opt.weight_decay=0.01
     sampler.staleness=0 sampler.vocab_logprobs=128 sampler.weight_noise_scale=0.02
     dtypes.sampler=float32 dtypes.eval=float32 rl.is.level=null
