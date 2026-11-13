@@ -1,0 +1,1041 @@
+diff --git a/train_rl.py b/train_rl.py
+index 48644d0..7826ad9 100644
+--- a/train_rl.py
++++ b/train_rl.py
+@@ -1,7 +1,11 @@
+ """Synchronous RL (REINFORCE + IS corrections + score centering) with a
+ deliberately mismatched sampler: stale, noisy, or quantized weights and KV cache."""
++import hashlib
++import json
+ import os
++from contextlib import contextmanager
+ from functools import partial
++from pathlib import Path
+ 
+ os.environ.setdefault("XLA_CLIENT_MEM_FRACTION", "0.85")
+ # No BFC preallocation: at 30B the fp32 masters pin the middle of the pool
+@@ -20,6 +24,7 @@ from tqdm.auto import tqdm
+ import losses
+ import models
+ import rollout
++import score_centering_rebel_loss as rebel
+ import utils
+ from models import quant, sampling
+ 
+@@ -29,7 +34,8 @@ model:
+   source: Qwen/Qwen3-1.7B
+   weights_dir: ~/.cache/postax/weights
+ dtypes:
+-  sampler: bfloat16  # bfloat16 | int8 | float8_e4m3fn (8-bit weights and activations)
++  sampler: bfloat16  # bfloat16 | float32 | int8 | float8_e4m3fn
++  eval: bfloat16  # bfloat16 | float32
+ sampler:
+   shard:
+     tp: null  # sampler tensor parallelism (null: all devices)
+@@ -43,6 +49,28 @@ rl:
+   seq_len: 1024
+   reward_mode: group_centered  # plus_minus | plus_zero | zero_minus | group_centered
+   sc: false  # score centering
++  pg_head_chunk: 128
++  pg_dtype: bfloat16
++  pg_microbatch_prompts: null
++  pg_lr_probe: null
++  pg_lr_probe_sgd_baseline: null
++  pg_lr_probe_microbatch_prompts: null
++  rebel: false
++  rebel_reference: trainer  # trainer | sampler (ordinary REBEL ablation)
++  rebel_beta: 1.0
++  rebel_dtype: bfloat16
++  rebel_inner_steps: 4
++  rebel_microbatch_prompts: null
++  rebel_lr_probe: null
++  rebel_lr_probe_sgd_baseline: null
++  rebel_lr_probe_extra_adamw: null
++  rebel_lr_probe_extra_beta: null
++  rebel_lr_probe_sc_pg_reference: null
++  rebel_lr_probe_diagnostics: false
++  rebel_lr_probe_clean_bf16: false
++  rebel_checkpoint_dir: null
++  rebel_checkpoint_every: 5
++  rebel_checkpoint_first: 0
+   is:  # IS correction; named methods are points on this grid (table in README.md)
+     level: null    # null (off) | token | seq_mean | seq_sum
+     stat: ratio    # ratio | tv
+@@ -57,6 +85,9 @@ env:
+ opt:
+   optimizer: sgd
+   lr: 0.01
++  b2: 0.999
++  eps: 1.0e-8
++  weight_decay: 1.0e-4
+ stop:
+   steps: 100
+   collapse: 0.5  # stop after 10 steps below this fraction of the peak reward (0 disables)
+@@ -69,6 +100,7 @@ log:
+   dir: ./outputs
+   run_name: null
+   save_model: false
++  pg_trace_steps: []  # outer indices for writing individual PG rollout diagnostics
+ run:
+   seed: 0
+ """
+@@ -82,14 +114,246 @@ def fixed_weight_delta(weights, key, scale):
+     return jax.tree.unflatten(structure, deltas)
+ 
+ 
++def checkpoint_signature(cfg, initial_weights, dataset):
++    config = OmegaConf.to_container(cfg, resolve=True)
++    del config["log"], config["model"], config["stop"]["steps"]
++    if config["dtypes"].get("eval") == "bfloat16":
++        del config["dtypes"]["eval"]
++    del config["rl"]["rebel_checkpoint_dir"], config["rl"]["rebel_checkpoint_every"]
++    config["rl"].pop("rebel_checkpoint_first", None)
++    if config["rl"]["rebel_reference"] == "trainer":
++        del config["rl"]["rebel_reference"]
++    config["rl"].pop("rebel_lr_probe", None)
++    config["rl"].pop("rebel_lr_probe_sgd_baseline", None)
++    config["rl"].pop("rebel_lr_probe_extra_adamw", None)
++    config["rl"].pop("rebel_lr_probe_extra_beta", None)
++    config["rl"].pop("rebel_lr_probe_sc_pg_reference", None)
++    config["rl"].pop("rebel_lr_probe_diagnostics", None)
++    config["rl"].pop("rebel_lr_probe_clean_bf16", None)
++    config["rl"].pop("pg_dtype", None)
++    config["rl"].pop("pg_microbatch_prompts", None)
++    config["rl"].pop("pg_lr_probe", None)
++    config["rl"].pop("pg_lr_probe_sgd_baseline", None)
++    config["rl"].pop("pg_lr_probe_microbatch_prompts", None)
++    for name, default in (("b2", 0.999), ("eps", 1e-8), ("weight_decay", 1e-4)):
++        if config["opt"]["optimizer"] == "sgd" or config["opt"].get(name) == default:
++            config["opt"].pop(name, None)
++    config["device_count"] = jax.device_count()
++    config["matmul_precision"] = jax.config.jax_default_matmul_precision
++    config["dataset_fingerprint"] = dataset._fingerprint
++    digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode())
++    for name, weight in sorted(initial_weights.items()):
++        digest.update(name.encode())
++        digest.update(np.asarray(weight).tobytes())
++    return digest.hexdigest()
++
++
++@contextmanager
++def checkpoint_write_lock():
++    lock_path = os.environ.get("REBEL_CHECKPOINT_LOCK")
++    if not lock_path:
++        yield
++        return
++
++    import fcntl
++
++    with Path(lock_path).expanduser().open("a+b") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        yield
++
++
++def save_checkpoint(path, signature, next_step, weights, opt_state, key, peak_reward, collapse_steps):
++    """Commit a completed outer step as one replaceable archive."""
++    arrays = jax.tree.leaves((weights, opt_state))
++    metadata = json.dumps({"version": 1, "signature": signature, "next_step": next_step,
++                           "peak_reward": float(peak_reward), "collapse_steps": collapse_steps})
++    temporary = path.with_suffix(".tmp")
++    save_archive = np.savez_compressed if os.environ.get("REBEL_COMPRESS_CHECKPOINT") == "1" else np.savez
++    with checkpoint_write_lock():
++        with temporary.open("wb") as output:
++            save_archive(output, metadata=metadata, key=np.asarray(jax.random.key_data(key)),
++                         **{f"array_{i}": np.asarray(array) for i, array in enumerate(arrays)})
++            output.flush()
++            os.fsync(output.fileno())
++        temporary.replace(path)
++    print(f"REBEL_CHECKPOINT_SAVED step={next_step}", flush=True)
++
++
++def load_checkpoint(path, signature, stop_step, weights, opt_state, key):
++    templates, structure = jax.tree.flatten((weights, opt_state))
++    with np.load(path, allow_pickle=False) as archive:
++        metadata = json.loads(archive["metadata"].item())
++        if metadata["version"] != 1 or metadata["signature"] != signature:
++            raise ValueError(f"Checkpoint {path} does not match the requested run")
++        next_step = metadata["next_step"]
++        peak_reward = metadata["peak_reward"]
++        collapse_steps = metadata["collapse_steps"]
++        if (type(next_step) is not int or not 0 <= next_step <= stop_step
++                or not np.isfinite(peak_reward)
++                or type(collapse_steps) is not int or not 0 <= collapse_steps <= min(next_step, 10)):
++            raise ValueError(f"Invalid progress metadata in checkpoint {path}")
++        if set(archive.files) != {"metadata", "key"} | {f"array_{i}" for i in range(len(templates))}:
++            raise ValueError(f"Unexpected arrays in checkpoint {path}")
++        arrays = []
++        for i, template in enumerate(templates):
++            array = archive[f"array_{i}"]
++            if array.shape != template.shape or array.dtype != template.dtype:
++                raise ValueError(f"Unexpected shape or dtype for array {i} in checkpoint {path}")
++            arrays.append(jax.device_put(array, template.sharding))
++        key_data = archive["key"]
++        if key_data.shape != jax.random.key_data(key).shape or key_data.dtype != np.uint32:
++            raise ValueError(f"Invalid rollout RNG in checkpoint {path}")
++        key = jax.random.wrap_key_data(jnp.asarray(key_data), impl=jax.random.key_impl(key))
++    weights, opt_state = jax.tree.unflatten(structure, arrays)
++    return weights, opt_state, key, next_step, peak_reward, collapse_steps
++
++
++def restore_metric_log(path, next_step, resumed):
++    """Retain committed records and discard any steps ahead of the checkpoint."""
++    if not path.exists():
++        if next_step:
++            raise ValueError(f"Missing metrics for checkpoint at step {next_step}: {path}")
++        return
++    with path.open("r+b") as log:
++        if not resumed and log.read(1):
++            raise ValueError(f"Metrics already exist but the checkpoint is missing: {path}")
++        for expected in range(next_step):
++            line = log.readline()
++            if not line.endswith(b"\n") or json.loads(line)["step"] != expected:
++                raise ValueError(f"Missing or unordered metrics at step {expected}: {path}")
++        log.truncate()
++
++
+ def train(cfg):
++    if cfg.log.pg_trace_steps and (
++        cfg.rl.rebel or jax.device_count() != 1 or cfg.rl.seq_len % 32
++        or not isinstance(cfg.sampler.vocab_logprobs, int)
++        or cfg.sampler.vocab_logprobs <= 0
++    ):
++        raise ValueError("PG rollout traces require one device, sampler top-k, and a sequence cap divisible by 32")
++    pg_probe_rates = cfg.rl.pg_lr_probe
++    pg_probe_sgd_baseline = cfg.rl.pg_lr_probe_sgd_baseline
++    pg_probe_micro_prompts = cfg.rl.pg_lr_probe_microbatch_prompts
++    pg_micro_prompts = cfg.rl.pg_microbatch_prompts
++    probe_rates = cfg.rl.rebel_lr_probe
++    probe_sgd_baseline = cfg.rl.rebel_lr_probe_sgd_baseline
++    probe_extra_adamw = cfg.rl.rebel_lr_probe_extra_adamw
++    probe_extra_beta = cfg.rl.rebel_lr_probe_extra_beta
++    probe_sc_pg_reference = cfg.rl.rebel_lr_probe_sc_pg_reference
++    probe_diagnostics = cfg.rl.rebel_lr_probe_diagnostics
++    probe_clean_bf16 = cfg.rl.rebel_lr_probe_clean_bf16
++    probe_active = pg_probe_rates is not None or probe_rates is not None
++    if not cfg.rl.rebel:
++        if cfg.rl.pg_dtype not in ("bfloat16", "float32"):
++            raise ValueError("PG trainer dtype must be bfloat16 or float32")
++        if pg_micro_prompts is not None and (
++            type(pg_micro_prompts) is not int or pg_micro_prompts <= 0 or cfg.rl.num_prompts % pg_micro_prompts
++        ):
++            raise ValueError("PG microbatch prompts must divide the total prompts")
++    if pg_probe_rates is not None:
++        if (cfg.rl.rebel or cfg.opt.optimizer != "adamw" or cfg.stop.steps != 1 or cfg.rl.rebel_checkpoint_dir
++                or cfg.rl["is"].level is not None):
++            raise ValueError("The PG LR probe requires one outer step of PG with AdamW, without IS or checkpointing")
++        if not OmegaConf.is_list(pg_probe_rates) or not pg_probe_rates or any(
++            type(rate) not in (int, float) or not np.isfinite(rate) or rate <= 0
++            for rate in pg_probe_rates
++        ):
++            raise ValueError("The PG LR probe requires a nonempty list of positive finite learning rates")
++        if cfg.rl.sc and (type(cfg.sampler.vocab_logprobs) is not int or cfg.sampler.vocab_logprobs <= 0):
++            raise ValueError("The score-centered PG LR probe requires top-k sampler log-probabilities")
++        if pg_probe_micro_prompts is not None and (
++            type(pg_probe_micro_prompts) is not int or pg_probe_micro_prompts <= 0
++            or cfg.rl.num_prompts % pg_probe_micro_prompts
++        ):
++            raise ValueError("PG probe microbatch prompts must divide the total prompts")
++    if pg_probe_sgd_baseline is not None and (
++        pg_probe_rates is None or type(pg_probe_sgd_baseline) not in (int, float)
++        or not np.isfinite(pg_probe_sgd_baseline) or pg_probe_sgd_baseline <= 0
++    ):
++        raise ValueError("A PG SGD baseline requires a PG LR probe and a positive finite learning rate")
++
++    if probe_rates is not None:
++        if (not cfg.rl.rebel or cfg.rl.sc or cfg.opt.optimizer not in ("sgd", "adamw")
++                or cfg.stop.steps != 1 or cfg.rl.rebel_checkpoint_dir):
++            raise ValueError("The LR probe requires one outer step of ordinary REBEL with SGD or AdamW and no checkpoint")
++        if not OmegaConf.is_list(probe_rates) or not probe_rates or any(
++            type(rate) not in (int, float) or not np.isfinite(rate) or rate <= 0
++            for rate in probe_rates
++        ):
++            raise ValueError("The LR probe requires a nonempty list of positive finite learning rates")
++    if probe_sgd_baseline is not None and (
++        probe_rates is None or type(probe_sgd_baseline) not in (int, float)
++        or not np.isfinite(probe_sgd_baseline) or probe_sgd_baseline <= 0
++    ):
++        raise ValueError("An SGD baseline requires an LR probe and a positive finite learning rate")
++    if probe_extra_adamw is not None:
++        if probe_rates is None or cfg.opt.optimizer != "adamw":
++            raise ValueError("Extra AdamW candidates require an AdamW LR probe")
++        if not OmegaConf.is_list(probe_extra_adamw) or any(
++            not OmegaConf.is_list(pair) or len(pair) != 2 or any(
++                type(value) not in (int, float) or not np.isfinite(value) or value <= 0
++                for value in pair
++            ) for pair in probe_extra_adamw
++        ):
++            raise ValueError("Extra AdamW candidates must be [epsilon, learning rate] pairs of positive finite numbers")
++    if probe_extra_beta is not None:
++        if probe_rates is None or cfg.opt.optimizer != "adamw":
++            raise ValueError("Extra beta candidates require an AdamW LR probe")
++        if not OmegaConf.is_list(probe_extra_beta) or any(
++            not OmegaConf.is_list(pair) or len(pair) != 2 or any(
++                type(value) not in (int, float) or not np.isfinite(value) or value <= 0
++                for value in pair
++            ) for pair in probe_extra_beta
++        ):
++            raise ValueError("Extra beta candidates must be [beta, learning rate] pairs of positive finite numbers")
++    if probe_sc_pg_reference is not None:
++        if (probe_rates is None or cfg.opt.optimizer != "adamw" or cfg.rl.rebel_dtype != "float32"
++                or cfg.rl.reward_mode != "group_centered" or type(cfg.sampler.vocab_logprobs) is not int
++                or cfg.sampler.vocab_logprobs <= 0):
++            raise ValueError("The SC-PG reference requires an FP32 AdamW probe with group-centered rewards and top-k sampler log-probabilities")
++        if (type(probe_sc_pg_reference) not in (int, float) or not np.isfinite(probe_sc_pg_reference)
++                or probe_sc_pg_reference <= 0):
++            raise ValueError("The SC-PG reference requires a positive finite SGD learning rate")
++    if cfg.dtypes.eval not in ("bfloat16", "float32"):
++        raise ValueError("Evaluation dtype must be bfloat16 or float32")
++    if probe_diagnostics and probe_rates is None:
++        raise ValueError("REBEL probe diagnostics require an LR probe")
++    if probe_clean_bf16 and (not probe_diagnostics or cfg.dtypes.sampler != "bfloat16"
++                            or cfg.dtypes.eval != "bfloat16"):
++        raise ValueError("Clean BF16 score diagnostics require REBEL diagnostics and BF16 sampling and evaluation")
++
++    if cfg.rl.rebel_reference not in ("trainer", "sampler"):
++        raise ValueError("REBEL reference must be trainer or sampler")
++    if cfg.rl.rebel_reference == "sampler" and (not cfg.rl.rebel or cfg.rl.sc or probe_active):
++        raise ValueError("The sampler reference is supported for ordinary REBEL training")
++    if cfg.rl.rebel:
++        if cfg.sampler.staleness or cfg.rl["is"].level is not None:
++            raise ValueError("REBEL requires a fresh sampler and no importance-sampling correction")
++        if cfg.rl.rebel_inner_steps < 2 or not np.isfinite(cfg.rl.rebel_beta) or cfg.rl.rebel_beta <= 0:
++            raise ValueError("REBEL needs at least two inner steps and a positive finite beta")
++        if cfg.rl.sc and not isinstance(cfg.sampler.vocab_logprobs, int):
++            raise ValueError("Centered REBEL requires the sampler's top-k log-probabilities")
++        micro_prompts = cfg.rl.rebel_microbatch_prompts
++        if micro_prompts is not None and (micro_prompts <= 0 or cfg.rl.num_prompts % micro_prompts):
++            raise ValueError("REBEL microbatch prompts must divide the total prompts")
++    checkpoint_dir = cfg.rl.rebel_checkpoint_dir
++    checkpoint_path = Path(checkpoint_dir).expanduser() / "checkpoint.npz" if checkpoint_dir else None
++    if checkpoint_path is not None and (cfg.sampler.staleness or not cfg.log.run_name
++                                        or cfg.rl.rebel_checkpoint_every <= 0 or jax.process_count() != 1):
++        raise ValueError("Checkpointing requires a fresh sampler, a fixed run name, a positive interval, and one host")
++    first_checkpoint = cfg.rl.rebel_checkpoint_first
++    if type(first_checkpoint) is not int or not 0 <= first_checkpoint <= cfg.stop.steps:
++        raise ValueError("The first extra checkpoint must be zero or a positive outer update within the run")
++    if first_checkpoint and checkpoint_path is None:
++        raise ValueError("The first extra checkpoint requires a checkpoint directory")
+     key = jax.random.key(cfg.run.seed)
+     model = models.load(cfg.model.source, cfg.model.weights_dir)
+     model.weights = jax.tree.map(lambda w: w.astype(jnp.float32), model.weights)  # fp32 masters
+     trainer_mesh = jax.tree.leaves(model.weights)[0].sharding.mesh
+-    optimizer = utils.make_optimizer(cfg.opt.optimizer, cfg.opt.lr)
+-    opt_state = optimizer.init(model.weights)
+-    run_dir = utils.start_run(cfg)
++    adamw_options = {"b2": cfg.opt.b2, "eps": cfg.opt.eps, "weight_decay": cfg.opt.weight_decay}
++    optimizer = (optax.adamw(cfg.opt.lr, **adamw_options) if cfg.opt.optimizer == "adamw"
++                 else utils.make_optimizer(cfg.opt.optimizer, cfg.opt.lr))
++    opt_state = None if probe_active else optimizer.init(model.weights)
+     is_cfg = {**cfg.rl["is"], "low": float(cfg.rl["is"].low), "high": float(cfg.rl["is"].high)}
+     correction = None if is_cfg["level"] is None else losses.ISCorrection(**is_cfg).check()
+ 
+@@ -101,13 +365,19 @@ def train(cfg):
+     sampler_dtype = jnp.dtype(cfg.dtypes.sampler)
+     quantized = sampler_dtype.itemsize == 1
+     float_dtype = jnp.bfloat16 if quantized else sampler_dtype
+-    copy_to_sampler = jax.jit(
+-        lambda weights: {k: w.astype(float_dtype) if w.ndim > 1 and "norm" not in k else w for k, w in weights.items()},
+-        out_shardings={k: NamedSharding(sampler_mesh, w.sharding.spec) for k, w in model.weights.items()})
++    eval_dtype = jnp.dtype(cfg.dtypes.eval)
++    sampler_shardings = {k: NamedSharding(sampler_mesh, w.sharding.spec) for k, w in model.weights.items()}
++
++    def copy_weights(weights, dtype):
++        return {k: w.astype(dtype) if w.ndim > 1 and "norm" not in k else w for k, w in weights.items()}
++
++    copy_to_sampler = jax.jit(partial(copy_weights, dtype=float_dtype), out_shardings=sampler_shardings)
++    copy_to_eval = (copy_to_sampler if eval_dtype == float_dtype
++                    else jax.jit(partial(copy_weights, dtype=eval_dtype), out_shardings=sampler_shardings))
+     scale = cfg.sampler.weight_noise_scale
+     noise = copy_to_sampler(fixed_weight_delta(model.weights, jax.random.fold_in(key, 2), scale)) if scale else None
+ 
+-    @partial(jax.jit, donate_argnums=() if quantized else (0,))
++    @partial(jax.jit, donate_argnums=() if quantized or float_dtype == jnp.float32 else (0,))
+     def perturb_and_quantize(weights, noise):
+         if noise is not None:
+             weights = jax.tree.map(jnp.add, weights, noise)
+@@ -120,20 +390,23 @@ def train(cfg):
+ 
+     sampler_forward = partial(model.forward, dtype=float_dtype, kv_quant_bits=cfg.sampler.kv_quant_bits)
+     sampler_init_kv = partial(model.init_kv, dtype=float_dtype)
+-    # Eval samples in clean bf16: it measures the policy, not the sampler.
+-    eval_forward = partial(model.forward, dtype=jnp.bfloat16)
++    # Evaluation uses clean weights and an unquantized cache.
++    eval_forward = partial(model.forward, dtype=eval_dtype)
++    eval_init_kv = sampler_init_kv if eval_dtype == float_dtype else partial(model.init_kv, dtype=eval_dtype)
+ 
+     env = rollout.load_env(cfg.env.id, **(OmegaConf.to_container(cfg.env.args) if cfg.env.args else {}))
+     # Hub datasets are ordered by source: shuffle so they aren't a curriculum.
+     dataset = env.get_dataset().shuffle(seed=cfg.run.seed)
+     eval_rows = [dataset[i] for i in range(cfg.eval.num_prompts)]  # held out from training
+     dataset = dataset.select(range(cfg.eval.num_prompts, len(dataset)))
++    signature = (checkpoint_signature(cfg, model.weights, dataset) if checkpoint_path is not None else None)
+     num_prompts, group_size, seq_len = cfg.rl.num_prompts, cfg.rl.group_size, cfg.rl.seq_len
+     assert cfg.eval.num_prompts % num_prompts == 0, "eval.num_prompts must be a multiple of rl.num_prompts"
+     token_sharding = NamedSharding(trainer_mesh, P("data", None))
+     head_sharding = NamedSharding(trainer_mesh, P("data", None, None))
+ 
+-    def sample(rows, weights, key, forward, vocab_logprobs=None):
++    def sample(rows, weights, key, forward, vocab_logprobs=None, *, init_kv=sampler_init_kv,
++               trace_records=None):
+         """group_size scored completions per row. Returns the trainer-side batch,
+         the full sampler logprobs if requested (still on the sampler mesh), the
+         rewards, and rollout statistics."""
+@@ -141,7 +414,7 @@ def train(cfg):
+         tokens, prompt_lengths = rollout.prompt_buffer(rows, model.tokenizer, seq_len, cfg.env.prompt_format)
+         with jax.set_mesh(sampler_mesh):
+             tokens, token_logprobs, vocab, head_logprobs, head_ids = sampling.generate(
+-                key, model, weights, forward, sampler_init_kv, tokens, prompt_lengths,
++                key, model, weights, forward, init_kv, tokens, prompt_lengths,
+                 logprobs_dtype=jnp.float32 if vocab_logprobs == "full" else None,
+                 logprobs_topk=vocab_logprobs if isinstance(vocab_logprobs, int) else 0)
+             host_tokens = np.asarray(tokens)
+@@ -153,43 +426,555 @@ def train(cfg):
+                       "center_logprobs": reshard(head_logprobs, head_sharding)}
+         truncated = (prompt_lengths + lengths >= seq_len) & (host_tokens[:, -1] != model.tokenizer.eos_token_id)
+         stats = {"mean_completion_len": lengths.mean(), "frac_truncated": truncated.mean()}
+-        return batch, vocab, rollout.score(env.rubric, rows, texts, group_size), stats
++        rewards = rollout.score(env.rubric, rows, texts, group_size)
++        if trace_records is not None:
++            solved = rewards > 0
++            mixed_failure = ~solved & np.repeat(solved.reshape(-1, group_size).any(1), group_size)
++            def failures(capped):
++                return np.concatenate((np.flatnonzero(mixed_failure & (truncated == capped)),
++                                       np.flatnonzero(~solved & ~mixed_failure & (truncated == capped))))
++            for indices in (np.flatnonzero(solved), failures(False), failures(True)):
++                chosen_prompts = set()
++                for i in indices:
++                    group = int(i) // group_size
++                    if group in chosen_prompts:
++                        continue
++                    chosen_prompts.add(group)
++                    prompt_length = int(prompt_lengths[i])
++                    trace_records.append({
++                        "index": int(i), "prompt_group": group,
++                        "problem": rows[i].get("info", {}), "text": texts[i],
++                        "prompt_length": prompt_length, "length": int(lengths[i]),
++                        "truncated": bool(truncated[i]), "reward": float(rewards[i]),
++                        "completion_token_ids": host_tokens[i, prompt_length:prompt_length + lengths[i]].tolist(),
++                    })
++                    if len(chosen_prompts) == 3:
++                        break
++        return batch, vocab, rewards, stats
+ 
+     eval_key = jax.random.fold_in(key, 3)  # the same eval prompts and key every time
+ 
+     def evaluate():
+-        weights = copy_to_sampler(jax.block_until_ready(model.weights))
++        weights = copy_to_eval(jax.block_until_ready(model.weights))
+         return np.mean([
+-            sample(eval_rows[i:i + num_prompts], weights, jax.random.fold_in(eval_key, i), eval_forward)[2]
++            sample(eval_rows[i:i + num_prompts], weights, jax.random.fold_in(eval_key, i), eval_forward,
++                   init_kv=eval_init_kv)[2]
+             for i in range(0, len(eval_rows), num_prompts)])
+ 
++    trainer_dtype = jnp.dtype(cfg.rl.rebel_dtype if cfg.rl.rebel else cfg.rl.pg_dtype)
++
++    def trainer_hidden(weights, tokens):
++        return model.forward(tokens, weights, dtype=trainer_dtype, logits=False,
++                             live=tokens != model.tokenizer.pad_token_id)
++
++    head_key = "model.embed_tokens.weight" if model.config["tie_word_embeddings"] else "lm_head.weight"
++
++    def pg_objective(weights, batch, score_center, chunk):
++        hidden = trainer_hidden(weights, batch["tokens"])
++        head = partial(model.head, weights={head_key: weights[head_key]}, dtype=trainer_dtype)
++        return losses.loss_fn_rl(hidden, head, batch, correction, score_center, chunk=chunk)
++
++    @jax.jit
++    def trace_trainer_logprobs(weights, tokens):
++        hidden = trainer_hidden(weights, tokens)
++        head = partial(model.head, weights={head_key: weights[head_key]}, dtype=trainer_dtype)
++        eos_id = model.tokenizer.eos_token_id
++        targets = jnp.roll(tokens, -1, axis=1)
++        chunk = 32
++
++        def summarize_chunk(start):
++            h = jax.lax.dynamic_slice_in_dim(hidden, start, chunk, axis=1)
++            y = jax.lax.dynamic_slice_in_dim(targets, start, chunk, axis=1)
++            logp = jax.nn.log_softmax(head(h).astype(jnp.float32), axis=-1)
++            taken = losses.take_vocab(logp, y[..., None])[..., 0]
++            return jnp.stack((taken, logp[..., eos_id]), axis=-1)
++
++        values = jax.lax.map(summarize_chunk, jnp.arange(0, seq_len, chunk))
++        return values.transpose(1, 0, 2, 3).reshape(tokens.shape + (2,))
++
++    def log_pg_traces(step, batch, records, advantages):
++        if not records or jax.process_index() != 0:
++            return
++        # Keep the diagnostic shape fixed even after successes disappear.
++        ids = [record["index"] for record in records]
++        padded = np.asarray(ids + [ids[-1]] * (9 - len(ids)), dtype=np.int32)
++        tokens = jax.device_put(np.asarray(batch["tokens"])[padded], token_sharding)
++        lp = np.asarray(trace_trainer_logprobs(model.weights, tokens))
++        eos_id = model.tokenizer.eos_token_id
++        for j, record in enumerate(records):
++            i = record["index"]
++            first = record["prompt_length"] - 1
++            span = slice(first, first + record["length"])
++            logq = np.asarray(batch["sampling_token_logprobs"][i, span], dtype=np.float32)
++            top_ids = np.asarray(batch["center_ids"][i, span])
++            top_logq = np.asarray(batch["center_logprobs"][i, span], dtype=np.float32)
++            eos_hits = top_ids == eos_id
++            eos_found = eos_hits.any(-1)
++            eos_logged = np.where(eos_hits, top_logq, -np.inf).max(-1)
++            eos_upper = np.where(eos_found, eos_logged, top_logq.min(-1))
++            trainer = lp[j, span]
++            record.update(step=step, advantage=float(advantages[i]),
++                          sampler_logp=logq.round(6).tolist(),
++                          trainer_logp=trainer[:, 0].round(6).tolist(),
++                          trainer_eos_logp=trainer[:, 1].round(6).tolist(),
++                          sampler_eos_logp_upper=eos_upper.round(6).tolist(),
++                          sampler_eos_in_topk=eos_found.tolist())
++            print("PG_ROLLOUT_TRACE " + json.dumps(record, allow_nan=False, separators=(",", ":")),
++                  flush=True)
++
+     @partial(jax.jit, donate_argnums=(0, 1))
+     def optimize(weights, opt_state, batch):
+         def objective(weights):
+-            # padding is dead weight in the MoE dispatch: mask it out
+-            hidden = model.forward(batch["tokens"], weights, dtype=jnp.bfloat16, logits=False,
+-                                   live=batch["tokens"] != model.tokenizer.pad_token_id)
+-            head = lambda x: model.head(x, weights, dtype=jnp.bfloat16)
+-            return losses.loss_fn_rl(hidden, head, batch, correction, cfg.rl.sc)
++            return pg_objective(weights, batch, cfg.rl.sc, cfg.rl.pg_head_chunk)
+ 
+         (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(weights)
+         updates, opt_state = optimizer.update(grads, opt_state, weights)
+         weights = optax.apply_updates(weights, updates)
+         return weights, opt_state, {"loss": loss, "grad_norm": optax.global_norm(grads), **metrics}
+ 
+-    peak_reward = collapse_steps = 0
+-    for step in tqdm(range(cfg.stop.steps), disable=jax.process_index() != 0):
++    @jax.jit
++    def apply_train_update(weights, opt_state, grads):
++        updates, opt_state = optimizer.update(grads, opt_state, weights)
++        return optax.apply_updates(weights, updates), opt_state, optax.global_norm(grads)
++
++    probe_epsilons = {float(cfg.opt.eps)}
++    if probe_extra_adamw is not None:
++        probe_epsilons.update(float(epsilon) for epsilon, _ in probe_extra_adamw)
++    probe_optimizers = {("sgd", None): optax.sgd(1.0)}
++    probe_optimizers.update({
++        ("adamw", epsilon): optax.adamw(1.0, **(adamw_options | {"eps": epsilon}))
++        for epsilon in probe_epsilons
++    })
++
++    @partial(jax.jit, static_argnames=("optimizer_key",))
++    def apply_probe_update(weights, state, grads, rate, optimizer_key):
++        # A dynamic rate scales the unit-rate optimizer's full update, including AdamW decay.
++        updates, state = probe_optimizers[optimizer_key].update(grads, state, weights)
++        updates = jax.tree.map(lambda update: rate * update, updates)
++        return optax.apply_updates(weights, updates), state, optax.global_norm(grads)
++
++    @jax.jit
++    def probe_update_norm(weights, initial_weights):
++        return optax.global_norm(jax.tree.map(jnp.subtract, weights, initial_weights))
++
++    @partial(jax.jit, donate_argnums=(0,), static_argnames=("score_center", "chunk", "with_metrics"))
++    def accumulate_pg_gradient(accumulated, weights, batch, num_tokens, num_rollouts,
++                               score_center, chunk, with_metrics):
++        def objective(weights):
++            loss, metrics = pg_objective(weights, batch, score_center, chunk)
++            # Undo the microbatch normalization before accumulating its share of the full loss.
++            token_share = jnp.maximum(batch["mask"][:, 1:].sum(), 1) / num_tokens
++            if with_metrics:
++                # Upstream sequence-level masking is a mean over rollouts, unlike the token metrics.
++                mask_share = (batch["tokens"].shape[0] / num_rollouts
++                              if correction and correction.level != "token" else token_share)
++                metrics = {key: value * (mask_share if key == "frac_masked" else token_share)
++                           for key, value in metrics.items()}
++            return loss * token_share, metrics if with_metrics else {}
++
++        (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(weights)
++        return jax.tree.map(jnp.add, accumulated, grads), loss, metrics
++
++    def pg_batch_gradient(weights, microbatches, num_tokens, score_center, chunk, *, with_metrics=False):
++        grads = jax.tree.map(jnp.zeros_like, weights)
++        loss = 0.0
++        metrics = {}
++        num_rollouts = sum(microbatch["tokens"].shape[0] for microbatch in microbatches)
++        for microbatch in microbatches:
++            grads, micro_loss, micro_metrics = accumulate_pg_gradient(
++                grads, weights, microbatch, num_tokens, num_rollouts, score_center, chunk, with_metrics)
++            loss += micro_loss
++            for key, value in micro_metrics.items():
++                metrics[key] = metrics.get(key, 0.0) + value
++        return grads, loss, metrics
++
++    @jax.jit
++    def pg_probe_scores(weights, batch):
++        hidden = trainer_hidden(weights, batch["tokens"])
++        head = partial(model.head, weights={head_key: weights[head_key]}, dtype=trainer_dtype)
++        return rebel.rollout_scores(hidden, head, batch)
++
++    def run_pg_lr_probe(initial_weights, microbatches, num_tokens, digest):
++        grads, initial_loss, _ = pg_batch_gradient(
++            initial_weights, microbatches, num_tokens, cfg.rl.sc, min(cfg.rl.pg_head_chunk, 32))
++        initial_loss = float(initial_loss)
++        old_scores = [pg_probe_scores(initial_weights, microbatch) for microbatch in microbatches]
++        num_rollouts = sum(scores.size for scores in old_scores)
++        candidates = [("adamw", float(cfg.opt.eps), rate) for rate in pg_probe_rates]
++        if pg_probe_sgd_baseline is not None:
++            candidates.insert(0, ("sgd", None, pg_probe_sgd_baseline))
++        for name, epsilon, rate in candidates:
++            optimizer_key = (name, epsilon)
++            state = probe_optimizers[optimizer_key].init(initial_weights)
++            weights, state, grad_norm = apply_probe_update(
++                initial_weights, state, grads, jnp.asarray(rate, jnp.float32), optimizer_key)
++            del state
++            squared_log_ratio, advantage_weighted_delta = 0.0, 0.0
++            for microbatch, before_scores in zip(microbatches, old_scores, strict=True):
++                delta = pg_probe_scores(weights, microbatch) - before_scores
++                squared_log_ratio += jnp.square(delta).sum()
++                advantage_weighted_delta += (microbatch["advantages"] * delta).sum()
++            stats = {
++                "update_norm": float(probe_update_norm(weights, initial_weights)),
++                "rms_log_ratio": float(jnp.sqrt(squared_log_ratio / num_rollouts)),
++                "grad_norm": float(grad_norm),
++                "pg_loss_before": initial_loss,
++                "uncentered_pg_loss_change": float(-advantage_weighted_delta / num_tokens),
++            }
++            if jax.process_index() == 0:
++                record = {"optimizer": name, "eps": epsilon, "lr": float(rate), "rollout_digest": digest,
++                          "finite": all(np.isfinite(value) for value in stats.values()),
++                          **{key: value if np.isfinite(value) else None for key, value in stats.items()}}
++                print("PG_LR_PROBE_RESULT " + json.dumps(record, allow_nan=False), flush=True)
++
++    if cfg.rl.rebel:
++        def rebel_scores(hidden, head_weights, batch, old_hidden=None, old_head_weights=None):
++            head = partial(model.head, weights=head_weights, dtype=trainer_dtype)
++            old_head = (partial(model.head, weights=old_head_weights, dtype=trainer_dtype)
++                        if old_head_weights is not None else None)
++            return rebel.rollout_scores(hidden, head, batch, old_hidden=old_hidden, old_head=old_head)
++
++        @jax.jit
++        def reference(weights, batch):
++            if cfg.rl.rebel_reference == "sampler":
++                # The sampler stores each next-token log probability at its prefix index.
++                scores = jnp.where(batch["mask"][:, 1:], batch["sampling_token_logprobs"][:, :-1], 0.0)
++                return scores.sum(axis=1), None, None
++            hidden = trainer_hidden(weights, batch["tokens"])
++            head_weights = {head_key: weights[head_key]}
++            if cfg.rl.sc:
++                scores = rebel_scores(hidden, head_weights, batch, hidden, head_weights)
++                return scores, hidden, head_weights
++            return rebel_scores(hidden, head_weights, batch), None, None
++
++        def centered_score_moments(delta, rewards, beta):
++            delta = delta.reshape(-1, group_size)
++            target = beta * rewards.reshape(-1, group_size)
++            delta -= delta.mean(axis=1, keepdims=True)
++            target -= target.mean(axis=1, keepdims=True)
++            return jnp.stack([(delta * target).sum(), jnp.square(delta).sum(), jnp.square(target).sum()])
++
++        def score_decomposition(moments):
++            aligned, move_squared, target_squared = np.asarray(moments, dtype=np.float64)
++            if not np.isfinite(moments).all() or target_squared <= 0:
++                return {"target_aligned_move": None, "orthogonal_ratio": None, "centered_move_ratio": None}
++            coefficient = aligned / target_squared
++            orthogonal_ratio = np.sqrt(max(0.0, move_squared / target_squared - coefficient**2))
++            return {"target_aligned_move": float(coefficient), "orthogonal_ratio": float(orthogonal_ratio),
++                    "centered_move_ratio": float(np.sqrt(move_squared / target_squared))}
++
++        def rebel_objective(weights, batch, frozen, num_tokens, beta=None, *, report_log_ratio=False):
++            beta = cfg.rl.rebel_beta if beta is None else beta
++            old_scores, old_hidden, old_head_weights = frozen
++            hidden = trainer_hidden(weights, batch["tokens"])
++            scores = rebel_scores(hidden, {head_key: weights[head_key]}, batch,
++                                  old_hidden, old_head_weights)
++            loss = rebel.rebel_loss(scores, old_scores, batch["rebel_rewards"], group_size, beta)
++            # Each microbatch contributes its residual sum with the full-batch denominator.
++            loss = loss * scores.size / num_tokens
++            if report_log_ratio:
++                delta = scores - old_scores
++                moments = (centered_score_moments(delta, batch["rebel_rewards"], beta) if probe_diagnostics
++                           else jnp.zeros(3, dtype=jnp.float32))
++                return loss, jnp.square(delta).sum(), moments
++            return loss
++
++        evaluate_rebel = jax.jit(rebel_objective)
++        evaluate_probe = jax.jit(partial(rebel_objective, report_log_ratio=True))
++
++        @partial(jax.jit, donate_argnums=(0,))
++        def accumulate_rebel_gradient(accumulated, weights, batch, frozen, num_tokens, beta=None):
++            loss, grads = jax.value_and_grad(rebel_objective)(weights, batch, frozen, num_tokens, beta)
++            return jax.tree.map(jnp.add, accumulated, grads), loss
++
++        def rebel_batch_gradient(weights, microbatches, frozen_batches, num_tokens, beta=None):
++            grads = jax.tree.map(jnp.zeros_like, weights)
++            loss = 0.0
++            for microbatch, frozen in zip(microbatches, frozen_batches, strict=True):
++                grads, micro_loss = accumulate_rebel_gradient(
++                    grads, weights, microbatch, frozen, num_tokens, beta)
++                loss += micro_loss
++            return grads, loss
++
++        def rebel_batch_loss(weights, microbatches, frozen_batches, num_tokens):
++            return float(sum(evaluate_rebel(weights, microbatch, frozen, num_tokens)
++                             for microbatch, frozen in zip(microbatches, frozen_batches, strict=True)))
++
++        def probe_fit_statistics(weights, initial_weights, microbatches, frozen_batches, num_tokens, mse_scale,
++                                 beta=None):
++            loss, squared_log_ratio = 0.0, 0.0
++            moments = jnp.zeros(3, dtype=jnp.float32)
++            num_rollouts = 0
++            for microbatch, frozen in zip(microbatches, frozen_batches, strict=True):
++                micro_loss, micro_squared_log_ratio, micro_moments = evaluate_probe(
++                    weights, microbatch, frozen, num_tokens, beta)
++                loss += micro_loss
++                squared_log_ratio += micro_squared_log_ratio
++                if probe_diagnostics:
++                    moments += micro_moments
++                num_rollouts += microbatch["tokens"].shape[0]
++            stats = {
++                "mse_after": float(loss) * mse_scale,
++                "update_norm": float(probe_update_norm(weights, initial_weights)),
++                "rms_log_ratio": float(jnp.sqrt(squared_log_ratio / num_rollouts)),
++            }
++            stats = {name: value if np.isfinite(value) else None for name, value in stats.items()}
++            if probe_diagnostics:
++                stats["diagnostics"] = score_decomposition(moments)
++            return stats
++
++        @jax.jit
++        def bf16_matrix_change(weights, initial_weights):
++            # Use the same matrix selection as copy_to_sampler. The arguments are already snapshots.
++            keys = [name for name, weight in weights.items() if weight.ndim > 1 and "norm" not in name]
++            counts = jnp.stack([
++                jnp.sum(weights[name] != initial_weights[name], dtype=jnp.int32) for name in keys
++            ])
++            squares = jnp.stack([
++                jnp.square(weights[name].astype(jnp.float32) - initial_weights[name].astype(jnp.float32)).sum()
++                for name in keys
++            ])
++            return counts, squares
++
++        def bf16_weight_statistics(weights, initial_weights):
++            counts, squares = bf16_matrix_change(weights, initial_weights)
++            entries = sum(weight.size for name, weight in weights.items() if weight.ndim > 1 and "norm" not in name)
++            changed = int(np.asarray(counts).sum(dtype=np.int64))
++            norm = np.sqrt(np.asarray(squares).sum(dtype=np.float64))
++            return {"matrix_entries": entries, "changed_entries": changed,
++                    "changed_fraction": changed / entries, "effective_l2": float(norm) if np.isfinite(norm) else None}
++
++        @jax.jit
++        def clean_bf16_scores(weights, batch):
++            hidden = eval_forward(batch["tokens"], weights, logits=False,
++                                  live=batch["tokens"] != model.tokenizer.pad_token_id)
++            head = partial(model.head, weights={head_key: weights[head_key]}, dtype=jnp.bfloat16)
++            return rebel.rollout_scores(hidden, head, batch)
++
++        @jax.jit
++        def legacy_clean_bf16_score_moments(weights, batch, old_scores, beta):
++            # Keep the former nested compilation only for a no-update comparison.
++            delta = clean_bf16_scores(weights, batch) - old_scores
++            return centered_score_moments(delta, batch["rebel_rewards"], beta), jnp.square(delta).sum()
++
++        @jax.jit
++        def clean_bf16_score_moments(scores, old_scores, rewards, beta):
++            delta = scores - old_scores
++            return centered_score_moments(delta, rewards, beta), jnp.square(delta).sum()
++
++        def clean_bf16_score_statistics(weights, microbatches, initial_scores, beta, *, legacy=False):
++            moments = jnp.zeros(3, dtype=jnp.float32)
++            squares = 0.0
++            for microbatch, old_scores in zip(microbatches, initial_scores, strict=True):
++                if legacy:
++                    micro_moments, micro_squares = legacy_clean_bf16_score_moments(
++                        weights, microbatch, old_scores, beta)
++                else:
++                    # Both weights use the standalone scorer. Compile the reductions separately.
++                    scores = clean_bf16_scores(weights, microbatch)
++                    micro_moments, micro_squares = clean_bf16_score_moments(
++                        scores, old_scores, microbatch["rebel_rewards"], beta)
++                moments += micro_moments
++                squares += micro_squares
++            rms = float(jnp.sqrt(squares / sum(scores.size for scores in initial_scores)))
++            return {**score_decomposition(moments), "rms_log_ratio": rms if np.isfinite(rms) else None}
++
++        def add_bf16_probe_statistics(stats, weights, microbatches, bf16_baselines, beta):
++            if bf16_baselines is None:
++                return
++            clean_initial, sampler_initial, clean_score_initial = bf16_baselines
++            with jax.set_mesh(sampler_mesh):
++                clean_weights = copy_to_sampler(weights)
++                clean_changes = bf16_weight_statistics(clean_weights, clean_initial)
++                del clean_weights
++                sampler_weights = sampler_snapshot(weights)
++                sampler_changes = bf16_weight_statistics(sampler_weights, sampler_initial)
++                del sampler_weights
++            diagnostics = stats["diagnostics"]
++            diagnostics["clean_bf16_weights"] = clean_changes
++            diagnostics["sampler_bf16_weights"] = sampler_changes
++            if clean_score_initial is not None:
++                diagnostics["clean_bf16_scores"] = clean_bf16_score_statistics(
++                    weights, microbatches, clean_score_initial, beta)
++
++        def run_probe_sc_pg_reference(initial_weights, microbatches, frozen_batches, num_tokens, mse_scale, digest,
++                                      bf16_baselines):
++            grads, _, _ = pg_batch_gradient(
++                initial_weights, microbatches, num_tokens, True, min(cfg.rl.pg_head_chunk, 32))
++            optimizer_key = ("sgd", None)
++            rate = float(probe_sc_pg_reference)
++            weights, _, grad_norm = apply_probe_update(
++                initial_weights, probe_optimizers[optimizer_key].init(initial_weights), grads,
++                jnp.asarray(rate, jnp.float32), optimizer_key)
++            del grads
++            stats = probe_fit_statistics(weights, initial_weights, microbatches, frozen_batches, num_tokens, mse_scale)
++            add_bf16_probe_statistics(stats, weights, microbatches, bf16_baselines, cfg.rl.rebel_beta)
++            grad_norm = float(grad_norm)
++            if jax.process_index() == 0:
++                record = {"lr": rate, "beta": float(cfg.rl.rebel_beta), "rollout_digest": digest,
++                          "grad_norm": grad_norm if np.isfinite(grad_norm) else None, **stats}
++                print("REBEL_LR_PROBE_SC_PG_REFERENCE " + json.dumps(record, allow_nan=False), flush=True)
++
++        @jax.jit
++        def probe_gradient_scale(grads, epsilons):
++            leaves = jax.tree.leaves(grads)
++            squares = [jnp.square(grad) for grad in leaves]
++            total_squares = jnp.stack([jnp.sum(square) for square in squares])
++            below_counts, below_squares = [], []
++            for epsilon in epsilons:
++                below = [jnp.abs(grad) < epsilon for grad in leaves]
++                below_counts.append(jnp.stack([jnp.sum(mask, dtype=jnp.int32) for mask in below]))
++                below_squares.append(jnp.stack([
++                    jnp.sum(jnp.where(mask, square, 0))
++                    for mask, square in zip(below, squares, strict=True)
++                ]))
++            return total_squares, jnp.stack(below_counts), jnp.stack(below_squares)
++
++        def run_lr_probe(initial_weights, microbatches, frozen_batches, num_tokens, mse_scale, digest):
++            bf16_baselines = None
++            if probe_diagnostics and sampler_dtype == jnp.bfloat16:
++                clean_score_initial = ([clean_bf16_scores(initial_weights, batch) for batch in microbatches]
++                                       if probe_clean_bf16 else None)
++                if clean_score_initial is not None:
++                    beta = float(cfg.rl.rebel_beta)
++                    same_path = clean_bf16_score_statistics(initial_weights, microbatches, clean_score_initial, beta)
++                    legacy_path = clean_bf16_score_statistics(
++                        initial_weights, microbatches, clean_score_initial, beta, legacy=True)
++                    exact_zero = same_path["rms_log_ratio"] == 0.0
++                    if jax.process_index() == 0:
++                        record = {"rollout_digest": digest, "beta": beta, "exact_zero": exact_zero,
++                                  "same_path": same_path, "legacy_path": legacy_path}
++                        print("REBEL_LR_PROBE_BF16_AA " + json.dumps(record, allow_nan=False), flush=True)
++                    if not exact_zero:
++                        raise RuntimeError("Clean BF16 scorer changed on identical weights and rollouts")
++                bf16_baselines = (copy_to_sampler(initial_weights), sampler_snapshot(initial_weights),
++                                  clean_score_initial)
++            if probe_sc_pg_reference is not None:
++                run_probe_sc_pg_reference(
++                    initial_weights, microbatches, frozen_batches, num_tokens, mse_scale, digest, bf16_baselines)
++            initial_gradient = rebel_batch_gradient(initial_weights, microbatches, frozen_batches, num_tokens)
++            if probe_extra_adamw:
++                epsilons = sorted(probe_epsilons)
++                grads = initial_gradient[0]
++                total, counts, below_squares = probe_gradient_scale(grads, jnp.asarray(epsilons, jnp.float32))
++                gradient_entries = sum(grad.size for grad in jax.tree.leaves(grads))
++                total = np.asarray(total).sum(dtype=np.float64)
++                counts = np.asarray(counts).sum(axis=1, dtype=np.int64)
++                below_squares = np.asarray(below_squares).sum(axis=1, dtype=np.float64)
++                epsilon_stats = [
++                    {"eps": epsilon, "fraction_abs_below_eps": float(count) / gradient_entries,
++                     "fraction_squared_l2_below_eps": float(square / total) if np.isfinite(total) and total > 0 else None}
++                    for epsilon, count, square in zip(epsilons, counts, below_squares, strict=True)
++                ]
++                if jax.process_index() == 0:
++                    grad_scale = {"rollout_digest": digest, "gradient_entries": gradient_entries,
++                                  "epsilon_stats": epsilon_stats}
++                    print("REBEL_LR_PROBE_GRAD_SCALE " + json.dumps(grad_scale, allow_nan=False), flush=True)
++            inner_steps = cfg.rl.rebel_inner_steps
++            name = cfg.opt.optimizer
++            epsilon = float(cfg.opt.eps) if name == "adamw" else None
++            base_beta = float(cfg.rl.rebel_beta)
++            candidates = [(name, epsilon, rate, base_beta) for rate in probe_rates]
++            if probe_sgd_baseline is not None:
++                candidates.insert(0, ("sgd", None, probe_sgd_baseline, base_beta))
++            if probe_extra_adamw is not None:
++                candidates.extend(("adamw", float(epsilon), rate, base_beta)
++                                  for epsilon, rate in probe_extra_adamw)
++            if probe_extra_beta is not None:
++                candidates.extend(("adamw", float(cfg.opt.eps), rate, float(beta)) for beta, rate in probe_extra_beta)
++            for name, epsilon, rate, beta in candidates:
++                weights = initial_weights
++                optimizer_key = (name, epsilon)
++                state = probe_optimizers[optimizer_key].init(weights)
++                rate_array = jnp.asarray(rate, jnp.float32)
++                mse_trace, grad_norms = [], []
++                update_norm = rms_log_ratio = None
++                diagnostics = first_step = None
++                for inner_step in range(inner_steps):
++                    if inner_step == 0 and beta == base_beta:
++                        grads, loss = initial_gradient
++                    else:
++                        grads, loss = rebel_batch_gradient(
++                            weights, microbatches, frozen_batches, num_tokens, beta)
++                    weights, state, grad_norm = apply_probe_update(weights, state, grads, rate_array, optimizer_key)
++                    del grads
++                    mse, grad_norm = float(loss) * mse_scale, float(grad_norm)
++                    mse_trace.append(mse if np.isfinite(mse) else None)
++                    grad_norms.append(grad_norm if np.isfinite(grad_norm) else None)
++                    print(f"REBEL_LR_PROBE_STEP optimizer={name} lr={rate:g} update={inner_step + 1}/{inner_steps} "
++                          f"mse_before={mse:.8g} grad_norm={grad_norm:.8g} eps={epsilon} beta={beta:g}", flush=True)
++                    if mse_trace[-1] is None or grad_norms[-1] is None:
++                        break
++                    if inner_step == 0 and probe_diagnostics and probe_extra_beta:
++                        first_step = probe_fit_statistics(
++                            weights, initial_weights, microbatches, frozen_batches, num_tokens, mse_scale, beta)
++                else:
++                    stats = probe_fit_statistics(
++                        weights, initial_weights, microbatches, frozen_batches, num_tokens, mse_scale, beta)
++                    mse_trace.append(stats["mse_after"])
++                    update_norm = stats["update_norm"]
++                    rms_log_ratio = stats["rms_log_ratio"]
++                    if probe_diagnostics and stats["mse_after"] is not None:
++                        add_bf16_probe_statistics(stats, weights, microbatches, bf16_baselines, beta)
++                        diagnostics = stats["diagnostics"]
++                mse_trace.extend([None] * (inner_steps + 1 - len(mse_trace)))
++                grad_norms.extend([None] * (inner_steps - len(grad_norms)))
++                result = {"optimizer": name, "eps": epsilon, "lr": float(rate), "beta": beta,
++                          "mse": mse_trace, "grad_norms": grad_norms,
++                          "rollout_digest": digest, "finite": None not in mse_trace + grad_norms,
++                          "update_norm": update_norm, "rms_log_ratio": rms_log_ratio}
++                if probe_diagnostics:
++                    result["diagnostics"] = diagnostics
++                    if probe_extra_beta:
++                        result["first_step"] = first_step
++                if jax.process_index() == 0:
++                    print("REBEL_LR_PROBE_RESULT " + json.dumps(result, allow_nan=False), flush=True)
++
++    start_step = peak_reward = collapse_steps = 0
++    if checkpoint_path is not None:
++        metrics_path = Path(cfg.log.dir).expanduser() / cfg.log.project / cfg.log.run_name / "logs.jsonl"
++        resumed = checkpoint_path.exists()
++        if resumed:
++            # The sampler offset and eval key were rebuilt from the seed and initial weights above.
++            model.weights, opt_state, key, start_step, peak_reward, collapse_steps = load_checkpoint(
++                checkpoint_path, signature, cfg.stop.steps, model.weights, opt_state, key)
++            print(f"REBEL_CHECKPOINT_RESUMED step={start_step}", flush=True)
++        restore_metric_log(metrics_path, start_step, resumed)
++        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
++    run_dir = utils.start_run(cfg)
++    if checkpoint_path is not None and not resumed:
++        save_checkpoint(checkpoint_path, signature, start_step, model.weights, opt_state, key,
++                        peak_reward, collapse_steps)
++
++    def split_rollout_microbatches(batch, prompts_per_microbatch):
++        micro_rollouts = (prompts_per_microbatch or num_prompts) * group_size
++        # Keep whole prompt groups together so each group's residual mean is exact.
++        microbatches = [
++            jax.tree.map(
++                lambda x: x.at[start:start + micro_rollouts].get(out_sharding=x.sharding.spec), batch
++            )
++            for start in range(0, batch["tokens"].shape[0], micro_rollouts)
++        ]
++        return microbatches, micro_rollouts
++
++    stop_step = cfg.stop.steps if collapse_steps < 10 else start_step
++    for step in tqdm(range(start_step, stop_step), initial=start_step, total=stop_step,
++                     disable=jax.process_index() != 0):
+         if step % (cfg.sampler.staleness + 1) == 0:
+             sampler_weights = sampler_snapshot(model.weights)
+         metrics = {}
+-        if eval_rows and (step % cfg.eval.every_steps == 0 or step == cfg.stop.steps - 1):
++        if not probe_active and eval_rows and (step % cfg.eval.every_steps == 0 or step == cfg.stop.steps - 1):
+             metrics["eval_reward"] = evaluate()
+ 
+         rows = [dataset[(step * num_prompts + i) % len(dataset)] for i in range(num_prompts)]
+         key, sample_key = jax.random.split(key)
++        trace_records = [] if step in cfg.log.pg_trace_steps else None
+         batch, vocab, rewards, stats = sample(
+-            rows, sampler_weights, sample_key, sampler_forward, cfg.sampler.vocab_logprobs)
++            rows, sampler_weights, sample_key, sampler_forward, cfg.sampler.vocab_logprobs,
++            trace_records=trace_records)
+         advantages = losses.compute_advantages(rewards, group_size, cfg.rl.reward_mode)
++        if trace_records is not None:
++            log_pg_traces(step, batch, trace_records, advantages)
+         batch["advantages"] = jax.device_put(advantages, NamedSharding(trainer_mesh, P("data")))
+         if cfg.sampler.staleness == 0:
+             del sampler_weights
+@@ -198,7 +983,61 @@ def train(cfg):
+             # and collective scratch of this [B, T, V] array set the memory peak.
+             batch["sampling_vocab_logprobs"] = reshard(vocab, NamedSharding(trainer_mesh, P("data", None, "model")))
+             del vocab
+-        model.weights, opt_state, opt_metrics = optimize(model.weights, opt_state, batch)
++        if pg_probe_rates is not None:
++            num_tokens = jnp.maximum(batch["mask"][:, 1:].sum(), 1)
++            microbatches, micro_rollouts = split_rollout_microbatches(batch, pg_probe_micro_prompts or pg_micro_prompts)
++            rollout_digest = hashlib.sha256(np.asarray(batch["tokens"]).tobytes()).hexdigest()
++            print(f"PG LR probe: {len(rewards)} rollouts, {len(microbatches)} microbatches "
++                  f"of {micro_rollouts}, digest={rollout_digest}", flush=True)
++            run_pg_lr_probe(model.weights, microbatches, num_tokens, rollout_digest)
++            break
++        if cfg.rl.rebel:
++            batch["rebel_rewards"] = jax.device_put(
++                np.where(rewards > 0, 1.0, -1.0).astype(np.float32),
++                NamedSharding(trainer_mesh, P("data")))
++            num_tokens = jnp.maximum(batch["mask"][:, 1:].sum(), 1)
++            mse_scale = 2 * float(num_tokens) / len(rewards)
++            microbatches, micro_rollouts = split_rollout_microbatches(batch, micro_prompts)
++            rollout_digest = hashlib.sha256(np.asarray(batch["tokens"]).tobytes()).hexdigest()
++            inner_metrics = {"rollout_digest": rollout_digest, "rebel_microbatches": len(microbatches),
++                             "rebel_microbatch_rollouts": micro_rollouts}
++            print(f"REBEL outer {step}: {len(rewards)} rollouts, {len(microbatches)} microbatches "
++                  f"of {micro_rollouts}, digest={rollout_digest}", flush=True)
++            frozen_batches = [reference(model.weights, microbatch) for microbatch in microbatches]
++            if probe_rates is not None:
++                run_lr_probe(model.weights, microbatches, frozen_batches, num_tokens, mse_scale, rollout_digest)
++                break
++            for inner_step in range(cfg.rl.rebel_inner_steps):
++                grads, loss = rebel_batch_gradient(model.weights, microbatches, frozen_batches, num_tokens)
++                model.weights, opt_state, grad_norm = apply_train_update(model.weights, opt_state, grads)
++                del grads
++                mse, grad_norm = float(loss) * mse_scale, float(grad_norm)
++                if not np.isfinite(mse) or not np.isfinite(grad_norm):
++                    raise FloatingPointError(f"Nonfinite REBEL fit at outer {step}, inner {inner_step}")
++                inner_metrics[f"rebel_mse_before_inner_{inner_step}"] = mse
++                inner_metrics[f"rebel_grad_norm_inner_{inner_step}"] = grad_norm
++                print(f"REBEL outer {step} update {inner_step + 1}/{cfg.rl.rebel_inner_steps}: "
++                      f"mse_before={mse:.8g} grad_norm={grad_norm:.8g}", flush=True)
++
++            final_loss = rebel_batch_loss(model.weights, microbatches, frozen_batches, num_tokens)
++            final_mse = final_loss * mse_scale
++            if not np.isfinite(final_mse):
++                raise FloatingPointError(f"Nonfinite REBEL fit after outer step {step}")
++            print(f"REBEL outer {step} final: mse_after={final_mse:.8g}", flush=True)
++            opt_metrics = {"loss": final_loss, "grad_norm": grad_norm, "rebel_residual_mse": final_mse,
++                           "rebel_mse_after_fit": final_mse, **inner_metrics}
++            del microbatches, frozen_batches
++        elif pg_micro_prompts is not None:
++            num_tokens = jnp.maximum(batch["mask"][:, 1:].sum(), 1)
++            microbatches, micro_rollouts = split_rollout_microbatches(batch, pg_micro_prompts)
++            grads, loss, opt_metrics = pg_batch_gradient(
++                model.weights, microbatches, num_tokens, cfg.rl.sc, cfg.rl.pg_head_chunk, with_metrics=True)
++            model.weights, opt_state, grad_norm = apply_train_update(model.weights, opt_state, grads)
++            opt_metrics |= {"loss": loss, "grad_norm": grad_norm, "pg_microbatches": len(microbatches),
++                            "pg_microbatch_rollouts": micro_rollouts}
++            del grads, microbatches
++        else:
++            model.weights, opt_state, opt_metrics = optimize(model.weights, opt_state, batch)
+         del batch
+ 
+         reward = rewards.mean()
+@@ -206,11 +1045,17 @@ def train(cfg):
+         collapse_steps = collapse_steps + 1 if reward < cfg.stop.collapse * peak_reward else 0
+         utils.log_metrics(step, {"reward": reward, "frac_nonzero_advantage": (advantages != 0).mean(),
+                                  **stats, **opt_metrics, **metrics}, run_dir)
++        next_step = step + 1
++        if checkpoint_path is not None and (next_step % cfg.rl.rebel_checkpoint_every == 0
++                                            or next_step == first_checkpoint
++                                            or next_step == stop_step or collapse_steps == 10):
++            save_checkpoint(checkpoint_path, signature, next_step, model.weights, opt_state, key,
++                            peak_reward, collapse_steps)
+         if collapse_steps == 10:
+             print(f"reward collapsed below {cfg.stop.collapse} x peak: stopping")
+             break
+ 
+-    if cfg.log.save_model and jax.process_index() == 0:
++    if not probe_active and cfg.log.save_model and jax.process_index() == 0:
+         models.save(model, run_dir / "final_model")
+     if jax.process_index() == 0:
+         wandb.finish()

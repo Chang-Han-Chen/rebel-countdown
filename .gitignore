@@ -1,0 +1,5 @@
+/.upstream/
+/.upstream.tmp.*/
+/.venv/
+/.weights/
+__pycache__/
